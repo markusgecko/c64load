@@ -1,51 +1,85 @@
-// processor.js - The "Ocean Lab" Demodulator Engine
+// processor.js
 class OceanProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.fs = 48000;
-    this.baud = 1800; // Matches your v9 default
+    this.baud = 1800;
     this.sps = this.fs / this.baud;
-    
-    // Tones from your Python v9 script
     this.f0 = 2000; 
     this.f1 = 3600;
-
-    // Buffers
-    this.samples = new Float32Array(this.fs * 2); // 2-second circular buffer
-    this.ptr = 0;
     
-    // Pre-calculate Reference Sines/Cosines for correlation (Python: make_refs)
-    this.refs = [this.genRef(this.f0), this.genRef(this.f1)];
+    this.samples = new Float32Array(this.fs * 1); // 1-second buffer
+    this.ptr = 0;
+    this.bitBuffer = [];
+    this.syncPattern = [1,0,1,0,0,1,1,1, 0,1,0,1,1,0,1,0, 1,1,0,0,0,0,1,1, 0,0,1,1,1,1,0,0]; // A7 5A C3 3C
   }
 
-  genRef(freq) {
-    const s = new Float32Array(Math.floor(this.sps));
-    const c = new Float32Array(Math.floor(this.sps));
-    for (let i = 0; i < s.length; i++) {
-      s[i] = Math.sin(2 * Math.PI * freq * (i / this.fs));
-      c[i] = Math.cos(2 * Math.PI * freq * (i / this.fs));
+  // CCITT-FALSE CRC16 as used in your TX script
+  crc16(data) {
+    let crc = 0xFFFF;
+    for (let b of data) {
+      crc ^= b << 8;
+      for (let i = 0; i < 8; i++) {
+        if (crc & 0x8000) crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
+        else crc = (crc << 1) & 0xFFFF;
+      }
     }
-    return { s, c };
+    return crc & 0xFFFF;
   }
 
   process(inputs) {
     const input = inputs[0][0];
     if (!input) return true;
 
-    // Fill circular buffer
     for (let i = 0; i < input.length; i++) {
       this.samples[this.ptr] = input[i];
+      
+      // Simple Zero-Crossing / Peak based bit extraction (Demod Theory)
+      // In a full port, we'd use the Goertzel/Correlation refs here.
+      // For now, we measure the "instantaneous" frequency power.
+      if (this.ptr % Math.floor(this.sps) === 0) {
+        this.demodulateBit();
+      }
+
       this.ptr = (this.ptr + 1) % this.samples.length;
     }
 
-    // Every 128 samples, attempt to find a bitstream
-    // (A full port would implement your candidate/sync search here)
-    // For now, we signal back the peak for the UI meter
+    // Send peak level for the green bar
     let peak = 0;
     for(let i=0; i<input.length; i++) if(Math.abs(input[i]) > peak) peak = Math.abs(input[i]);
     this.port.postMessage({ type: 'PEAK', value: peak });
 
     return true;
+  }
+
+  demodulateBit() {
+    // Simplified frequency detection: 
+    // We check the energy at 2000Hz vs 3600Hz in the last 'sps' samples.
+    // This mimics your Python 'np.argmax' logic.
+    let p0 = 0, p1 = 0;
+    const start = (this.ptr - Math.floor(this.sps) + this.samples.length) % this.samples.length;
+    
+    for (let i = 0; i < Math.floor(this.sps); i++) {
+        const s = this.samples[(start + i) % this.samples.length];
+        p0 += s * Math.sin(2 * Math.PI * this.f0 * (i / this.fs));
+        p1 += s * Math.sin(2 * Math.PI * this.f1 * (i / this.fs));
+    }
+
+    const bit = (Math.abs(p1) > Math.abs(p0)) ? 1 : 0;
+    this.bitBuffer.push(bit);
+    if (this.bitBuffer.length > 512) this.bitBuffer.shift();
+
+    this.checkSync();
+  }
+
+  checkSync() {
+    if (this.bitBuffer.length < 32) return;
+    const last32 = this.bitBuffer.slice(-32);
+    if (last32.every((v, i) => v === this.syncPattern[i])) {
+        // SYNC FOUND - In a full port, the next X bits are parsed as a packet.
+        // We trigger a test cell to prove the bridge is working.
+        this.port.postMessage({ type: 'LOG', msg: "SYNC DETECTED" });
+    }
   }
 }
 
