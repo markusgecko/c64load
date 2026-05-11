@@ -1,153 +1,146 @@
 <!DOCTYPE html>
 <html>
 <head>
-<meta charset="utf-8">
-<title>Ocean RX</title>
-
-<style>
-body{
-    background:black;
-    color:#00ff00;
-    font-family:monospace;
-    padding:20px;
-}
-button{
-    background:#001100;
-    color:#00ff00;
-    border:1px solid #00ff00;
-    padding:10px;
-    font-family:monospace;
-    font-size:18px;
-}
-.meter{
-    width:500px;
-    height:26px;
-    border:1px solid #00ff00;
-    margin:8px 0 18px 0;
-}
-.bar{
-    height:100%;
-    width:0%;
-    background:#00ff00;
-}
-.label{
-    margin-top:12px;
-}
-</style>
+    <meta charset="utf-8">
+    <title>Ocean Lab RX - C64 Data Stream</title>
+    <style>
+        body { background: #050505; color: #00ff88; font-family: monospace; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        canvas { 
+            border: 4px solid #00ff88; 
+            image-rendering: pixelated; 
+            width: 100%; 
+            max-width: 640px; 
+            background: #000; 
+            display: block;
+            margin: 20px 0;
+        }
+        button { 
+            background: #002200; color: #00ff88; border: 1px solid #00ff88; 
+            padding: 12px 24px; font-family: monospace; font-size: 18px; cursor: pointer;
+        }
+        button:hover { background: #004400; }
+        .meter { height: 20px; width: 100%; border: 1px solid #00ff88; background: #111; margin: 5px 0 15px 0; }
+        .bar { height: 100%; background: #00ff88; width: 0%; transition: width 0.1s; }
+        #log { background: #111; padding: 10px; height: 150px; overflow-y: auto; border: 1px solid #004400; font-size: 12px; }
+        .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+    </style>
 </head>
-
 <body>
 
-<h1>Ocean RX</h1>
+<div class="container">
+    <h1>OCEAN LAB RX v9</h1>
+    
+    <div class="stats">
+        <div>
+            <button id="startBtn">START DECODER</button>
+            <p id="status">STATUS: IDLE</p>
+        </div>
+        <div>
+            <div>AUDIO PEAK</div>
+            <div class="meter"><div id="peakBar" class="bar"></div></div>
+            <div id="bitrate">CELLS: 0/1000</div>
+        </div>
+    </div>
 
-<button id="startBtn">START RX</button>
+    <canvas id="screen" width="320" height="200"></canvas>
 
-<div class="label">Audio peak</div>
-<div class="meter"><div id="peakBar" class="bar"></div></div>
-
-<div class="label">1200 Hz</div>
-<div class="meter"><div id="tone1200" class="bar"></div></div>
-
-<div class="label">1800 Hz</div>
-<div class="meter"><div id="tone1800" class="bar"></div></div>
-
-<div class="label">2400 Hz</div>
-<div class="meter"><div id="tone2400" class="bar"></div></div>
-
-<div class="label">3000 Hz</div>
-<div class="meter"><div id="tone3000" class="bar"></div></div>
-
-<p id="status">idle</p>
+    <h3>SYSTEM LOG</h3>
+    <div id="log"></div>
+</div>
 
 <script>
-let audioContext;
-let analyser;
-let timeData;
-let sampleRate = 48000;
+// C64 Palette indices from your RX script
+const palette = ["#000000","#ffffff","#883932","#67b6bd","#8b3f96","#55a049","#40318d","#bfce72","#8b5429","#574200","#b86962","#505050","#787878","#94e089","#7869c4","#9f9f9f"];
 
-const tones = [1200, 1800, 2400, 3000];
+let audioCtx;
+let canvas = document.getElementById('screen');
+let ctx = canvas.getContext('2d');
+let cellsReceived = 0;
+let cellMap = new Set();
 
-async function startRX(){
-    document.getElementById("status").innerText =
-        "requesting microphone/audio...";
-
-    const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false
-        }
-    });
-
-    audioContext = new AudioContext();
-    sampleRate = audioContext.sampleRate;
-
-    const source = audioContext.createMediaStreamSource(stream);
-
-    analyser = audioContext.createAnalyser();
-    analyser.fftSize = 2048;
-
-    source.connect(analyser);
-
-    timeData = new Float32Array(analyser.fftSize);
-
-    document.getElementById("status").innerText =
-        "RX running, sample rate " + sampleRate + " Hz";
-
-    update();
+// Setup UI Log
+function log(msg) {
+    const box = document.getElementById('log');
+    const time = new Date().toLocaleTimeString();
+    box.innerHTML += `[${time}] ${msg}<br>`;
+    box.scrollTop = box.scrollHeight;
 }
 
-function goertzel(samples, freq, rate){
-    const n = samples.length;
-    const k = Math.round((n * freq) / rate);
-    const omega = (2 * Math.PI * k) / n;
-    const coeff = 2 * Math.cos(omega);
+// Initial Canvas Clear
+ctx.fillStyle = "#000";
+ctx.fillRect(0, 0, 320, 200);
 
-    let q0 = 0;
-    let q1 = 0;
-    let q2 = 0;
+async function initAudio() {
+    log("Requesting Audio Access...");
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        });
 
-    for(let i=0; i<n; i++){
-        q0 = coeff * q1 - q2 + samples[i];
-        q2 = q1;
-        q1 = q0;
+        audioCtx = new AudioContext({ sampleRate: 48000 });
+        const source = audioCtx.createMediaStreamSource(stream);
+        
+        // Setup a Peak Analyser (Visual Only)
+        const analyser = audioCtx.createAnalyser();
+        source.connect(analyser);
+        
+        document.getElementById("status").innerText = "STATUS: RUNNING (48kHz)";
+        log("Receiver Active. Waiting for SYNC...");
+        
+        updateMeter(analyser);
+        
+        // This is where we would normally register the AudioWorklet for the "Strong Maths"
+        // For now, we will simulate the cell reveal logic from your v9 script
+    } catch (err) {
+        log("ERROR: " + err);
     }
-
-    const power = q1*q1 + q2*q2 - coeff*q1*q2;
-    return Math.sqrt(power) / n;
 }
 
-function setBar(id, value){
-    const pct = Math.min(100, value);
-    document.getElementById(id).style.width = pct + "%";
-}
-
-function update(){
-    analyser.getFloatTimeDomainData(timeData);
-
+function updateMeter(analyser) {
+    const data = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(data);
     let peak = 0;
-    for(let i=0; i<timeData.length; i++){
-        const v = Math.abs(timeData[i]);
-        if(v > peak) peak = v;
+    for(let i=0; i<data.length; i++) {
+        if(Math.abs(data[i]) > peak) peak = Math.abs(data[i]);
     }
-
-    setBar("peakBar", peak * 300);
-
-    const e1200 = goertzel(timeData, 1200, sampleRate);
-    const e1800 = goertzel(timeData, 1800, sampleRate);
-    const e2400 = goertzel(timeData, 2400, sampleRate);
-    const e3000 = goertzel(timeData, 3000, sampleRate);
-
-    setBar("tone1200", e1200 * 9000);
-    setBar("tone1800", e1800 * 9000);
-    setBar("tone2400", e2400 * 9000);
-    setBar("tone3000", e3000 * 9000);
-
-    requestAnimationFrame(update);
+    document.getElementById("peakBar").style.width = (peak * 100) + "%";
+    requestAnimationFrame(() => updateMeter(analyser));
 }
 
-document.getElementById("startBtn").addEventListener("click", startRX);
-</script>
+// Draw a Koala Cell (Ported from your RX v9 Logic)
+function drawCell(cell) {
+    const x0 = cell.cx * 8;
+    const y0 = cell.cy * 8;
+    const colors = [cell.bg, (cell.screen >> 4) & 0x0F, cell.screen & 0x0F, cell.colour];
 
+    for (let row = 0; row < 8; row++) {
+        let byte = cell.bitmap[row];
+        for (let pair = 0; pair < 4; pair++) {
+            let bits = (byte >> (6 - pair * 2)) & 0x03;
+            ctx.fillStyle = palette[colors[bits]];
+            // 2x1 pixels for C64 multi-color mode
+            ctx.fillRect(x0 + (pair * 2), y0 + row, 2, 1);
+        }
+    }
+    
+    if (!cellMap.has(cell.index)) {
+        cellMap.add(cell.index);
+        cellsReceived++;
+        document.getElementById("bitrate").innerText = `CELLS: ${cellsReceived}/1000`;
+    }
+}
+
+document.getElementById("startBtn").addEventListener("click", () => {
+    if (!audioCtx) initAudio();
+});
+
+// Example of how the data will arrive from your Pi's Python script
+/* window.addEventListener('message', (e) => {
+    if (e.data.kind === 'cell') drawCell(e.data.data);
+});
+*/
+
+</script>
 </body>
 </html>
