@@ -1,146 +1,208 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <meta charset="utf-8">
-    <title>Ocean Lab RX - C64 Data Stream</title>
+    <meta charset="UTF-8">
+    <title>Ocean Lab 2FSK XOR Decoder</title>
     <style>
-        body { background: #050505; color: #00ff88; font-family: monospace; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        canvas { 
-            border: 4px solid #00ff88; 
-            image-rendering: pixelated; 
-            width: 100%; 
-            max-width: 640px; 
-            background: #000; 
-            display: block;
-            margin: 20px 0;
-        }
-        button { 
-            background: #002200; color: #00ff88; border: 1px solid #00ff88; 
-            padding: 12px 24px; font-family: monospace; font-size: 18px; cursor: pointer;
-        }
-        button:hover { background: #004400; }
-        .meter { height: 20px; width: 100%; border: 1px solid #00ff88; background: #111; margin: 5px 0 15px 0; }
-        .bar { height: 100%; background: #00ff88; width: 0%; transition: width 0.1s; }
-        #log { background: #111; padding: 10px; height: 150px; overflow-y: auto; border: 1px solid #004400; font-size: 12px; }
-        .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+        body { background: #050505; color: #00ff88; font-family: 'Courier New', monospace; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; border: 1px solid #00ff88; padding: 20px; box-shadow: 0 0 15px #00ff88; }
+        #log { background: #000; border: 1px solid #004422; height: 150px; overflow-y: auto; padding: 10px; margin: 10px 0; font-size: 0.85em; }
+        .group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 10px; margin-top: 20px; }
+        .group-box { border: 1px solid #004422; padding: 5px; text-align: center; font-size: 10px; }
+        .chunk-dots { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px; margin-top: 5px; }
+        .dot { width: 6px; height: 6px; background: #222; border-radius: 1px; }
+        .dot.received { background: #00ff88; box-shadow: 0 0 3px #00ff88; }
+        .dot.recovered { background: #ff00ff; box-shadow: 0 0 3px #ff00ff; }
+        .status-bar { display: flex; justify-content: space-between; border-bottom: 1px solid #004422; padding-bottom: 10px; }
+        button { background: #00ff88; border: none; padding: 10px 20px; cursor: pointer; font-family: inherit; font-weight: bold; }
+        button:disabled { background: #004422; color: #050505; }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h1>OCEAN LAB RX v9</h1>
-    
-    <div class="stats">
-        <div>
-            <button id="startBtn">START DECODER</button>
-            <p id="status">STATUS: IDLE</p>
-        </div>
-        <div>
-            <div>AUDIO PEAK</div>
-            <div class="meter"><div id="peakBar" class="bar"></div></div>
-            <div id="bitrate">CELLS: 0/1000</div>
-        </div>
+    <h1>OCEAN LAB: 2FSK XOR 8+1</h1>
+    <div class="status-bar">
+        <div>STATUS: <span id="status">IDLE</span></div>
+        <div>RECOVERIES: <span id="rec-count">0</span></div>
+        <button id="start-btn">ENABLE LISTENER</button>
     </div>
 
-    <canvas id="screen" width="320" height="200"></canvas>
-
-    <h3>SYSTEM LOG</h3>
     <div id="log"></div>
+
+    <div id="file-info" style="display:none; margin-top:10px;">
+        RECEIVING: <span id="filename">rat.prg</span> (<span id="filesize">0</span> bytes)
+        <progress id="progress" value="0" max="100" style="width:100%;"></progress>
+    </div>
+
+    <div class="group-grid" id="grid"></div>
+    
+    <div id="download-area" style="margin-top:20px; display:none;">
+        <button id="dl-btn">DOWNLOAD REASSEMBLED FILE</button>
+    </div>
 </div>
 
 <script>
-// C64 Palette indices from your RX script
-const palette = ["#000000","#ffffff","#883932","#67b6bd","#8b3f96","#55a049","#40318d","#bfce72","#8b5429","#574200","#b86962","#505050","#787878","#94e089","#7869c4","#9f9f9f"];
+// --- Protocol Constants (Matching your Python TX) ---
+const BAUD = 1200;
+const TONE_0 = 1200;
+const TONE_1 = 1800;
+const SYNC = [0xA7, 0x5A, 0xC3, 0x3C];
+const CHUNK_SIZE = 64;
 
-let audioCtx;
-let canvas = document.getElementById('screen');
-let ctx = canvas.getContext('2d');
-let cellsReceived = 0;
-let cellMap = new Set();
+// --- Decoder State ---
+let audioCtx, analyzer, processor;
+let bitBuffer = [];
+let groups = {}; // {groupId: {chunkId: Uint8Array}}
+let recoveredCount = 0;
+let totalFileSize = 0;
+let isComplete = false;
 
-// Setup UI Log
-function log(msg) {
-    const box = document.getElementById('log');
-    const time = new Date().toLocaleTimeString();
-    box.innerHTML += `[${time}] ${msg}<br>`;
-    box.scrollTop = box.scrollHeight;
-}
+const log = (msg) => {
+    const div = document.getElementById('log');
+    div.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+    div.scrollTop = div.scrollHeight;
+};
 
-// Initial Canvas Clear
-ctx.fillStyle = "#000";
-ctx.fillRect(0, 0, 320, 200);
-
-async function initAudio() {
-    log("Requesting Audio Access...");
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
-        });
-
-        audioCtx = new AudioContext({ sampleRate: 48000 });
-        const source = audioCtx.createMediaStreamSource(stream);
-        
-        // Setup a Peak Analyser (Visual Only)
-        const analyser = audioCtx.createAnalyser();
-        source.connect(analyser);
-        
-        document.getElementById("status").innerText = "STATUS: RUNNING (48kHz)";
-        log("Receiver Active. Waiting for SYNC...");
-        
-        updateMeter(analyser);
-        
-        // This is where we would normally register the AudioWorklet for the "Strong Maths"
-        // For now, we will simulate the cell reveal logic from your v9 script
-    } catch (err) {
-        log("ERROR: " + err);
+// --- XOR Logic ---
+function tryXORRecovery(groupId) {
+    const group = groups[groupId];
+    const chunkIds = Object.keys(group).map(Number);
+    if (chunkIds.length === 8) {
+        const missingId = Array.from({length: 9}, (_, i) => i).find(id => !chunkIds.includes(id));
+        const recovered = new Uint8Array(CHUNK_SIZE);
+        for (const id in group) {
+            for (let i = 0; i < CHUNK_SIZE; i++) recovered[i] ^= group[id][i];
+        }
+        groups[groupId][missingId] = recovered;
+        recoveredCount++;
+        document.getElementById('rec-count').innerText = recoveredCount;
+        log(`XOR Recovery: Group ${groupId}, Chunk ${missingId}`);
+        updateGrid();
+        return true;
     }
+    return false;
 }
 
-function updateMeter(analyser) {
-    const data = new Float32Array(analyser.fftSize);
-    analyser.getFloatTimeDomainData(data);
-    let peak = 0;
-    for(let i=0; i<data.length; i++) {
-        if(Math.abs(data[i]) > peak) peak = Math.abs(data[i]);
-    }
-    document.getElementById("peakBar").style.width = (peak * 100) + "%";
-    requestAnimationFrame(() => updateMeter(analyser));
-}
+// --- Sync & Frame Parsing ---
+function processBytes(bytes) {
+    for (let i = 0; i <= bytes.length - 72; i++) {
+        // Check for SYNC
+        if (bytes[i] === SYNC[0] && bytes[i+1] === SYNC[1] && bytes[i+2] === SYNC[2] && bytes[i+3] === SYNC[3]) {
+            const bodyLen = (bytes[i+4] << 8) | bytes[i+5];
+            const body = bytes.slice(i+6, i+6+bodyLen);
+            // Quick check if body length looks right for your chunks
+            if (body.length > 0) {
+                const type = body[0];
+                const gId = (body[1] << 8) | body[2];
+                const cId = body[3];
+                totalFileSize = (body[4] << 24) | (body[5] << 16) | (body[6] << 8) | body[7];
+                const payload = body.slice(8);
 
-// Draw a Koala Cell (Ported from your RX v9 Logic)
-function drawCell(cell) {
-    const x0 = cell.cx * 8;
-    const y0 = cell.cy * 8;
-    const colors = [cell.bg, (cell.screen >> 4) & 0x0F, cell.screen & 0x0F, cell.colour];
+                if (!groups[gId]) {
+                    groups[gId] = {};
+                    log(`New Group Detected: ${gId}`);
+                    document.getElementById('file-info').style.display = 'block';
+                    document.getElementById('filesize').innerText = totalFileSize;
+                }
 
-    for (let row = 0; row < 8; row++) {
-        let byte = cell.bitmap[row];
-        for (let pair = 0; pair < 4; pair++) {
-            let bits = (byte >> (6 - pair * 2)) & 0x03;
-            ctx.fillStyle = palette[colors[bits]];
-            // 2x1 pixels for C64 multi-color mode
-            ctx.fillRect(x0 + (pair * 2), y0 + row, 2, 1);
+                if (!groups[gId][cId]) {
+                    groups[gId][cId] = payload;
+                    tryXORRecovery(gId);
+                    updateGrid();
+                }
+
+                if (type === 0xFF) {
+                    isComplete = true;
+                    document.getElementById('download-area').style.display = 'block';
+                    log("SUCCESS: End Frame Received.");
+                }
+            }
         }
     }
-    
-    if (!cellMap.has(cell.index)) {
-        cellMap.add(cell.index);
-        cellsReceived++;
-        document.getElementById("bitrate").innerText = `CELLS: ${cellsReceived}/1000`;
-    }
 }
 
-document.getElementById("startBtn").addEventListener("click", () => {
-    if (!audioCtx) initAudio();
-});
+// --- UI Updates ---
+function updateGrid() {
+    const grid = document.getElementById('grid');
+    grid.innerHTML = '';
+    Object.keys(groups).sort((a,b) => a-b).forEach(gid => {
+        const box = document.createElement('div');
+        box.className = 'group-box';
+        box.innerHTML = `GRP ${gid}`;
+        const dots = document.createElement('div');
+        dots.className = 'chunk-dots';
+        for (let i = 0; i < 9; i++) {
+            const dot = document.createElement('div');
+            dot.className = 'dot' + (groups[gid][i] ? ' received' : '');
+            dots.appendChild(dot);
+        }
+        box.appendChild(dots);
+        grid.appendChild(box);
+    });
+}
 
-// Example of how the data will arrive from your Pi's Python script
-/* window.addEventListener('message', (e) => {
-    if (e.data.kind === 'cell') drawCell(e.data.data);
-});
-*/
+// --- DSP / Web Audio ---
+document.getElementById('start-btn').onclick = async () => {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    const source = audioCtx.createMediaStreamSource(stream);
+    
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+    
+    const sps = 48000 / BAUD;
+    let samples = new Float32Array(0);
 
+    processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        let combined = new Float32Array(samples.length + input.length);
+        combined.set(samples);
+        combined.set(input, samples.length);
+
+        while (combined.length >= sps) {
+            const chunk = combined.slice(0, sps);
+            combined = combined.slice(sps);
+            
+            // Simple Correlation for FSK
+            let p0 = 0, p1 = 0;
+            for (let i = 0; i < sps; i++) {
+                const phi0 = 2 * Math.PI * TONE_0 * i / 48000;
+                const phi1 = 2 * Math.PI * TONE_1 * i / 48000;
+                p0 += chunk[i] * Math.sin(phi0);
+                p1 += chunk[i] * Math.sin(phi1);
+            }
+            
+            bitBuffer.push(Math.abs(p1) > Math.abs(p0) ? 1 : 0);
+            if (bitBuffer.length >= 8) {
+                let byte = 0;
+                for (let b = 0; b < 8; b++) byte = (byte << 1) | bitBuffer.shift();
+                processBytes([byte]);
+            }
+        }
+        samples = combined;
+    };
+    
+    document.getElementById('start-btn').disabled = true;
+    document.getElementById('status').innerText = 'LISTENING';
+    log("Audio Engine Started at 48000Hz. Waiting for SYNC...");
+};
+
+document.getElementById('dl-btn').onclick = () => {
+    let final = new Uint8Array(Object.keys(groups).length * 8 * CHUNK_SIZE);
+    Object.keys(groups).forEach(gid => {
+        for (let cid = 0; cid < 8; cid++) {
+            if (groups[gid][cid]) final.set(groups[gid][cid], (gid * 8 + cid) * CHUNK_SIZE);
+        }
+    });
+    const blob = new Blob([final.slice(0, totalFileSize)], {type: 'application/octet-stream'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'rat.prg';
+    a.click();
+};
 </script>
 </body>
 </html>
