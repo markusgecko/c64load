@@ -2,245 +2,187 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Ocean Lab 2FSK XOR Decoder & Player</title>
+    <title>Ocean Lab 2FSK Decoder</title>
     <style>
-        body { background: #050505; color: #00ff88; font-family: 'Courier New', monospace; padding: 20px; line-height: 1.4; }
+        body { background: #050505; color: #00ff88; font-family: 'Courier New', monospace; padding: 20px; }
         .container { max-width: 900px; margin: 0 auto; border: 1px solid #00ff88; padding: 20px; box-shadow: 0 0 15px #00ff88; }
         .panel { border: 1px solid #004422; padding: 15px; margin-bottom: 20px; background: #080808; }
         #log { background: #000; border: 1px solid #004422; height: 180px; overflow-y: auto; padding: 10px; margin: 10px 0; font-size: 0.85em; color: #00cc66; }
         .group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); gap: 10px; }
         .group-box { border: 1px solid #004422; padding: 8px; text-align: center; font-size: 11px; background: #000; }
         .chunk-dots { display: flex; flex-wrap: wrap; justify-content: center; gap: 3px; margin-top: 5px; }
-        .dot { width: 8px; height: 8px; background: #222; border: 1px solid #111; }
+        .dot { width: 8px; height: 8px; background: #222; }
         .dot.received { background: #00ff88; box-shadow: 0 0 5px #00ff88; }
         .dot.recovered { background: #ff00ff; box-shadow: 0 0 5px #ff00ff; }
         .btn { background: #00ff88; border: none; padding: 10px 15px; cursor: pointer; font-family: inherit; font-weight: bold; color: #000; margin-right: 5px; }
-        .btn:hover { background: #00cc66; }
-        .btn:disabled { background: #003311; color: #006633; cursor: not-allowed; }
-        progress { width: 100%; height: 20px; accent-color: #00ff88; }
-        .status-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
     </style>
 </head>
 <body>
 
 <div class="container">
-    <h1>OCEAN LAB: 2FSK XOR 8+1 DECODER</h1>
+    <h1>OCEAN LAB: 2FSK XOR 8+1</h1>
     
     <div class="panel">
-        <div class="status-header">
-            <strong>AUDIO SOURCE</strong>
-            <span id="audio-status">OFFLINE</span>
-        </div>
-        <button id="mic-btn" class="btn">START MICROPHONE</button>
+        <strong>SOURCE: <span id="audio-status">OFFLINE</span></strong><br><br>
+        <button id="mic-btn" class="btn">START MIC</button>
+        <button id="test-rat-btn" class="btn">TEST REPO WAV</button>
+        <button id="upload-trigger" class="btn">LOAD LOCAL WAV</button>
         <input type="file" id="wav-upload" accept="audio/wav" style="display:none;">
-        <button id="upload-btn" class="btn">LOAD LOCAL WAV</button>
-        <button id="test-rat-btn" class="btn">TRY rat_2fsk_xor8_test.wav</button>
-    </div>
-
-    <div class="panel" id="rx-panel" style="display:none;">
-        <div class="status-header">
-            <strong>RECEIVING: <span id="filename">---</span></strong>
-            <span>XOR RECOVERIES: <b id="rec-count">0</b></span>
-        </div>
-        <progress id="progress" value="0" max="100"></progress>
-        <div id="file-meta" style="font-size: 0.8em; margin-top: 5px;"></div>
     </div>
 
     <div id="log"></div>
-
     <div class="group-grid" id="grid"></div>
     
-    <div id="download-area" style="margin-top:20px; display:none; text-align: center;">
-        <button id="dl-btn" class="btn" style="padding: 20px 40px; font-size: 1.2em;">💾 DOWNLOAD REASSEMBLED .PRG</button>
+    <div id="download-area" style="margin-top:20px; display:none;">
+        <button id="dl-btn" class="btn" style="width:100%; height:50px;">💾 DOWNLOAD RAT.PRG</button>
     </div>
 </div>
 
 <script>
-// --- Configuration ---
-const BAUD = 1200;
-const TONE_0 = 1200;
-const TONE_1 = 1800;
+const BAUD = 1200, TONE_0 = 1200, TONE_1 = 1800, CHUNK_SIZE = 64;
 const SYNC = [0xA7, 0x5A, 0xC3, 0x3C];
-const CHUNK_SIZE = 64;
-
-// --- State Management ---
-let audioCtx, processor, sourceNode;
-let bitBuffer = [];
-let groups = {}; 
-let recoveredCount = 0;
-let totalFileSize = 0;
-let metaFilename = "rat.prg";
+let audioCtx, processor, sourceNode, groups = {}, bitBuffer = [], totalFileSize = 0;
 
 const log = (msg) => {
-    const div = document.getElementById('log');
-    div.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
-    div.scrollTop = div.scrollHeight;
+    const d = document.getElementById('log');
+    d.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
+    d.scrollTop = d.scrollHeight;
 };
 
-// --- Logic: XOR Recovery ---
-function tryXORRecovery(groupId) {
-    const group = groups[groupId];
-    const ids = Object.keys(group).map(Number);
+// --- XOR Recovery ---
+function tryXOR(gid) {
+    const g = groups[gid], ids = Object.keys(g).map(Number);
     if (ids.length === 8) {
-        const missingId = [0,1,2,3,4,5,6,7,8].find(id => !ids.includes(id));
-        const recovered = new Uint8Array(CHUNK_SIZE);
-        for (const id in group) {
-            for (let i = 0; i < CHUNK_SIZE; i++) recovered[i] ^= group[id][i];
-        }
-        groups[groupId][missingId] = { payload: recovered, method: 'recovered' };
-        recoveredCount++;
-        document.getElementById('rec-count').innerText = recoveredCount;
-        log(`Group ${groupId}: Rebuilt missing chunk ${missingId} via XOR`);
+        const mid = [0,1,2,3,4,5,6,7,8].find(id => !ids.includes(id));
+        const res = new Uint8Array(CHUNK_SIZE);
+        for (const id in g) { for (let i=0; i<CHUNK_SIZE; i++) res[i] ^= g[id].payload[i]; }
+        groups[gid][mid] = { payload: res, method: 'recovered' };
+        log(`Group ${gid}: Rebuilt chunk ${mid} via XOR`);
         updateGrid();
     }
 }
 
-// --- Logic: Frame Parsing ---
+// --- Frame Processing ---
 function processBytes(bytes) {
-    for (let i = 0; i <= bytes.length - 72; i++) {
-        if (bytes[i] === SYNC[0] && bytes[i+1] === SYNC[1] && bytes[i+2] === SYNC[2] && bytes[i+3] === SYNC[3]) {
-            const bodyLen = (bytes[i+4] << 8) | bytes[i+5];
-            const body = bytes.slice(i+6, i+6+bodyLen);
+    if (!window.sBuf) window.sBuf = [];
+    window.sBuf.push(...bytes);
+    if (window.sBuf.length > 5000) window.sBuf.shift();
+    const b = window.sBuf;
+    for (let i=0; i <= b.length - 72; i++) {
+        if (b[i]===SYNC[0] && b[i+1]===SYNC[1] && b[i+2]===SYNC[2] && b[i+3]===SYNC[3]) {
+            const len = (b[i+4]<<8) | b[i+5];
+            const body = b.slice(i+6, i+6+len);
             if (body.length >= 8) {
-                const type = body[0];
-                const gId = (body[1] << 8) | body[2];
-                const cId = body[3];
-                totalFileSize = (body[4] << 24) | (body[5] << 16) | (body[6] << 8) | body[7];
-                const payload = body.slice(8);
-
+                const gId = (body[1]<<8) | body[2], cId = body[3];
+                totalFileSize = (body[4]<<24)|(body[5]<<16)|(body[6]<<8)|body[7];
                 if (!groups[gId]) groups[gId] = {};
                 if (!groups[gId][cId]) {
-                    groups[gId][cId] = { payload: payload, method: 'received' };
-                    document.getElementById('rx-panel').style.display = 'block';
-                    document.getElementById('filename').innerText = metaFilename;
-                    tryXORRecovery(gId);
-                    updateGrid();
+                    groups[gId][cId] = { payload: new Uint8Array(body.slice(8)), method: 'received' };
+                    tryXOR(gId); updateGrid();
                 }
-
-                if (type === 0xFF) {
-                    document.getElementById('download-area').style.display = 'block';
-                    log("SUCCESS: Reassembly Buffer Ready.");
-                }
+                if (body[0] === 0xFF) { document.getElementById('download-area').style.display='block'; log("END Frame detected."); }
             }
         }
     }
 }
 
-// --- UI Logic ---
-function updateGrid() {
-    const grid = document.getElementById('grid');
-    grid.innerHTML = '';
-    Object.keys(groups).sort((a,b) => a-b).forEach(gid => {
-        const box = document.createElement('div');
-        box.className = 'group-box';
-        box.innerHTML = `GRP ${gid}`;
-        const dots = document.createElement('div');
-        dots.className = 'chunk-dots';
-        for (let i = 0; i < 9; i++) {
-            const dot = document.createElement('div');
-            const data = groups[gid][i];
-            dot.className = 'dot' + (data ? ' ' + data.method : '');
-            dots.appendChild(dot);
-        }
-        box.appendChild(dots);
-        grid.appendChild(box);
-    });
-}
-
-// --- Audio Engine ---
-async function initAudio(streamSource = null) {
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 48000});
+// --- Audio DSP ---
+async function setupDSP() {
+    if (!audioCtx) audioCtx = new AudioContext({sampleRate: 48000});
     if (audioCtx.state === 'suspended') await audioCtx.resume();
-
     if (processor) processor.disconnect();
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    
     const sps = 48000 / BAUD;
     let samples = new Float32Array(0);
 
     processor.onaudioprocess = (e) => {
         const input = e.inputBuffer.getChannelData(0);
         let combined = new Float32Array(samples.length + input.length);
-        combined.set(samples);
-        combined.set(input, samples.length);
-
+        combined.set(samples); combined.set(input, samples.length);
         while (combined.length >= sps) {
-            const chunk = combined.slice(0, sps);
-            combined = combined.slice(sps);
+            const chunk = combined.slice(0, sps); combined = combined.slice(sps);
             let p0 = 0, p1 = 0;
-            for (let i = 0; i < sps; i++) {
-                const phi0 = 2 * Math.PI * TONE_0 * i / 48000;
-                const phi1 = 2 * Math.PI * TONE_1 * i / 48000;
-                p0 += chunk[i] * Math.sin(phi0);
-                p1 += chunk[i] * Math.sin(phi1);
+            for (let i=0; i<sps; i++) {
+                const phi = 2 * Math.PI * i / 48000;
+                p0 += chunk[i] * Math.sin(phi * TONE_0);
+                p1 += chunk[i] * Math.sin(phi * TONE_1);
             }
             bitBuffer.push(Math.abs(p1) > Math.abs(p0) ? 1 : 0);
             if (bitBuffer.length >= 8) {
                 let byte = 0;
-                for (let b = 0; b < 8; b++) byte = (byte << 1) | bitBuffer.shift();
+                for (let b=0; b<8; b++) byte = (byte << 1) | bitBuffer.shift();
                 processBytes([byte]);
             }
         }
         samples = combined;
     };
-
-    if (streamSource) {
-        streamSource.connect(processor);
-        processor.connect(audioCtx.destination);
-    }
+    processor.connect(audioCtx.destination);
+    return processor;
 }
 
-// --- Controls ---
+// --- Interface Handlers ---
 document.getElementById('mic-btn').onclick = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    sourceNode = audioCtx ? audioCtx.createMediaStreamSource(stream) : null; 
-    await initAudio(sourceNode || (audioCtx = new AudioContext()).createMediaStreamSource(stream));
+    const p = await setupDSP();
+    audioCtx.createMediaStreamSource(stream).connect(p);
     document.getElementById('audio-status').innerText = 'LIVE MIC';
-    log("Microphone active.");
 };
 
-document.getElementById('upload-btn').onclick = () => document.getElementById('wav-upload').click();
+async function playBuf(buffer, label) {
+    const p = await setupDSP();
+    if (sourceNode) sourceNode.stop();
+    sourceNode = audioCtx.createBufferSource();
+    sourceNode.buffer = buffer;
+    sourceNode.connect(p); // Connect directly to the DSP processor
+    sourceNode.start(0);
+    document.getElementById('audio-status').innerText = 'WAV PLAY';
+    log(`Piping ${label} into DSP...`);
+}
 
+document.getElementById('upload-trigger').onclick = () => document.getElementById('wav-upload').click();
 document.getElementById('wav-upload').onchange = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const arrayBuffer = await file.arrayBuffer();
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-    playBuffer(audioBuffer, file.name);
+    const f = e.target.files[0]; if (!f) return;
+    const buf = await (audioCtx || new AudioContext()).decodeAudioData(await f.arrayBuffer());
+    playBuf(buf, f.name);
 };
 
 document.getElementById('test-rat-btn').onclick = async () => {
-    log("Fetching test wav from repository...");
+    log("Fetching test file...");
     try {
-        const resp = await fetch('rat_2fsk_xor8_test.wav');
-        const buffer = await resp.arrayBuffer();
-        const audioBuffer = await audioCtx.decodeAudioData(buffer);
-        playBuffer(audioBuffer, "rat_2fsk_xor8_test.wav");
-    } catch(e) { log("Error: Could not find test wav in root folder."); }
+        const r = await fetch('./rat_2fsk_xor8_test.wav');
+        if (!r.ok) throw new Error("File not found on server.");
+        const ab = await r.arrayBuffer();
+        const buf = await (audioCtx || new AudioContext({sampleRate: 48000})).decodeAudioData(ab);
+        playBuf(buf, "rat_2fsk_xor8_test.wav");
+    } catch(err) { log("Error: " + err.message); }
 };
 
-function playBuffer(buffer, name) {
-    if (sourceNode) sourceNode.disconnect();
-    sourceNode = audioCtx.createBufferSource();
-    sourceNode.buffer = buffer;
-    initAudio(sourceNode);
-    sourceNode.start(0);
-    document.getElementById('audio-status').innerText = 'PLAYING WAV';
-    log(`Playing: ${name}`);
-}
-
 document.getElementById('dl-btn').onclick = () => {
-    const numGroups = Object.keys(groups).length;
-    let final = new Uint8Array(numGroups * 8 * CHUNK_SIZE);
-    Object.keys(groups).forEach(gid => {
-        for (let cid = 0; cid < 8; cid++) {
-            if (groups[gid][cid]) final.set(groups[gid][cid].payload, (gid * 8 + cid) * CHUNK_SIZE);
+    const gks = Object.keys(groups).sort((a,b)=>a-b);
+    let out = new Uint8Array(gks.length * 8 * CHUNK_SIZE);
+    gks.forEach(gid => {
+        for (let cid=0; cid<8; cid++) {
+            if (groups[gid][cid]) out.set(groups[gid][cid].payload, (gid*8+cid)*64);
         }
     });
-    const blob = new Blob([final.slice(0, totalFileSize)], {type: 'application/octet-stream'});
+    const blob = new Blob([out.slice(0, totalFileSize)], {type: 'application/octet-stream'});
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a'); a.href = url; a.download = 'rat.prg'; a.click();
 };
+
+function updateGrid() {
+    const grid = document.getElementById('grid'); grid.innerHTML = '';
+    Object.keys(groups).sort((a,b)=>a-b).forEach(gid => {
+        const box = document.createElement('div'); box.className = 'group-box'; box.innerHTML = `GRP ${gid}`;
+        const dots = document.createElement('div'); dots.className = 'chunk-dots';
+        for (let i=0; i<9; i++) {
+            const d = document.createElement('div');
+            d.className = 'dot' + (groups[gid][i] ? ' ' + groups[gid][i].method : '');
+            dots.appendChild(d);
+        }
+        box.appendChild(dots); grid.appendChild(box);
+    });
+}
 </script>
 </body>
 </html>
