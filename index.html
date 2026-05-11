@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html> 
+<html>
 <head>
 <meta charset="utf-8">
 <title>Ocean RX</title>
@@ -11,7 +11,6 @@ body{
     font-family:monospace;
     padding:20px;
 }
-
 button{
     background:#001100;
     color:#00ff00;
@@ -20,18 +19,19 @@ button{
     font-family:monospace;
     font-size:18px;
 }
-
-#meter{
+.meter{
     width:500px;
-    height:30px;
+    height:26px;
     border:1px solid #00ff00;
-    margin-top:20px;
+    margin:8px 0 18px 0;
 }
-
-#bar{
+.bar{
     height:100%;
     width:0%;
     background:#00ff00;
+}
+.label{
+    margin-top:12px;
 }
 </style>
 </head>
@@ -42,70 +42,111 @@ button{
 
 <button id="startBtn">START RX</button>
 
-<div id="meter">
-    <div id="bar"></div>
-</div>
+<div class="label">Audio peak</div>
+<div class="meter"><div id="peakBar" class="bar"></div></div>
+
+<div class="label">1200 Hz</div>
+<div class="meter"><div id="tone1200" class="bar"></div></div>
+
+<div class="label">1800 Hz</div>
+<div class="meter"><div id="tone1800" class="bar"></div></div>
+
+<div class="label">2400 Hz</div>
+<div class="meter"><div id="tone2400" class="bar"></div></div>
+
+<div class="label">3000 Hz</div>
+<div class="meter"><div id="tone3000" class="bar"></div></div>
 
 <p id="status">idle</p>
 
 <script>
-
 let audioContext;
 let analyser;
-let dataArray;
+let timeData;
+let sampleRate = 48000;
+
+const tones = [1200, 1800, 2400, 3000];
 
 async function startRX(){
-
     document.getElementById("status").innerText =
         "requesting microphone/audio...";
 
     const stream = await navigator.mediaDevices.getUserMedia({
-        audio:true
+        audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+        }
     });
 
     audioContext = new AudioContext();
+    sampleRate = audioContext.sampleRate;
 
-    const source =
-        audioContext.createMediaStreamSource(stream);
+    const source = audioContext.createMediaStreamSource(stream);
 
     analyser = audioContext.createAnalyser();
-
     analyser.fftSize = 2048;
 
     source.connect(analyser);
 
-    dataArray = new Uint8Array(analyser.fftSize);
+    timeData = new Float32Array(analyser.fftSize);
 
     document.getElementById("status").innerText =
-        "RX running";
+        "RX running, sample rate " + sampleRate + " Hz";
 
-    updateMeter();
+    update();
 }
 
-function updateMeter(){
+function goertzel(samples, freq, rate){
+    const n = samples.length;
+    const k = Math.round((n * freq) / rate);
+    const omega = (2 * Math.PI * k) / n;
+    const coeff = 2 * Math.cos(omega);
 
-    analyser.getByteTimeDomainData(dataArray);
+    let q0 = 0;
+    let q1 = 0;
+    let q2 = 0;
+
+    for(let i=0; i<n; i++){
+        q0 = coeff * q1 - q2 + samples[i];
+        q2 = q1;
+        q1 = q0;
+    }
+
+    const power = q1*q1 + q2*q2 - coeff*q1*q2;
+    return Math.sqrt(power) / n;
+}
+
+function setBar(id, value){
+    const pct = Math.min(100, value);
+    document.getElementById(id).style.width = pct + "%";
+}
+
+function update(){
+    analyser.getFloatTimeDomainData(timeData);
 
     let peak = 0;
-
-    for(let i=0;i<dataArray.length;i++){
-
-        let v = Math.abs(dataArray[i]-128);
-
+    for(let i=0; i<timeData.length; i++){
+        const v = Math.abs(timeData[i]);
         if(v > peak) peak = v;
     }
 
-    let pct = Math.min(100, peak * 2);
+    setBar("peakBar", peak * 300);
 
-    document.getElementById("bar").style.width =
-        pct + "%";
+    const e1200 = goertzel(timeData, 1200, sampleRate);
+    const e1800 = goertzel(timeData, 1800, sampleRate);
+    const e2400 = goertzel(timeData, 2400, sampleRate);
+    const e3000 = goertzel(timeData, 3000, sampleRate);
 
-    requestAnimationFrame(updateMeter);
+    setBar("tone1200", e1200 * 9000);
+    setBar("tone1800", e1800 * 9000);
+    setBar("tone2400", e2400 * 9000);
+    setBar("tone3000", e3000 * 9000);
+
+    requestAnimationFrame(update);
 }
 
-document.getElementById("startBtn")
-    .addEventListener("click", startRX);
-
+document.getElementById("startBtn").addEventListener("click", startRX);
 </script>
 
 </body>
